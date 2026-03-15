@@ -52,6 +52,12 @@ HERE = Path(__file__).parent.resolve()
 
 HF_BASE = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
 HF_TDRZ = "https://huggingface.co/akashmjn/tinydiarize-whisper.cpp/resolve/main"
+HF_VAD  = "https://huggingface.co/ggml-org/whisper-vad/resolve/main"
+
+# VAD model (Silero VAD, converted to GGML format)
+# Used with --vad flag to skip silence and speed up transcription.
+VAD_MODEL = "ggml-silero-v5.1.2.bin"
+VAD_URL   = f"{HF_VAD}/{VAD_MODEL}"
 
 MODELS = [
     # name                ggml file                          url                                       encoder_source
@@ -166,6 +172,19 @@ def process(name: str, force_download=False, force_convert=False):
         convert_encoder(name)
 
 
+def download_vad(force=False):
+    """Download the Silero VAD model used with --vad flag."""
+    dest = HERE / VAD_MODEL
+    if dest.exists() and not force:
+        print(f"  VAD model {VAD_MODEL} already present ({dest.stat().st_size/1e6:.1f} MB) – skip")
+        return
+    print(f"\n{'='*60}")
+    print(f"  VAD MODEL: {VAD_MODEL}")
+    print(f"{'='*60}")
+    download(VAD_URL, dest)
+    print(f"  [OK] VAD model ready")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Download + convert all whisper models")
     parser.add_argument("models", nargs="*",
@@ -177,6 +196,8 @@ def main():
                         help="Re-convert encoder even if .xml already exists")
     parser.add_argument("--list", action="store_true",
                         help="List all models and exit")
+    parser.add_argument("--vad", action="store_true",
+                        help="Download the Silero VAD model (enables --vad flag in the app)")
     args = parser.parse_args()
 
     if args.list:
@@ -190,6 +211,16 @@ def main():
             xml = encoder_xml(name)
             enc_status = "ready" if xml.exists() else "missing"
             print(f"  {name:<24} {status:<34} encoder: {enc_status}  ({enc_note})")
+        vad_path = HERE / VAD_MODEL
+        vad_status = f"{vad_path.stat().st_size/1e6:.1f} MB" if vad_path.exists() else "not downloaded"
+        print(f"\n  {'VAD (silero-v5.1.2)':<24} {vad_status}")
+        return
+
+    # ── VAD-only download ────────────────────────────────────────────────
+    if args.vad and not args.models:
+        download_vad(args.force_download)
+        print("\nNext step — rebuild to copy VAD model into build/Release:")
+        print("  cmake --build build --config Release")
         return
 
     targets = args.models if args.models else MODEL_NAMES

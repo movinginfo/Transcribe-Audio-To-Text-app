@@ -338,18 +338,20 @@ int main(int argc, char** argv)
 
     // Default thread count: all logical cores, capped at 8
     const int hw_threads     = static_cast<int>(std::thread::hardware_concurrency());
-    const int default_threads = std::max(1, std::min(hw_threads, 8));
+    const int default_threads = std::max(1, std::min(hw_threads, 16));
 
     // ── Argument parsing ─────────────────────────────────────────────────
     if (argc < 3) {
         std::cerr
             << "Usage: " << argv[0]
             << " <model> <audio.wav|audio.mp3|audio.flac|mic>\n"
-               "         [--device AUTO|NPU|GPU|CPU|MULTI:NPU,GPU]  (default: AUTO)\n"
+               "         [--device MULTI:NPU,GPU|NPU|GPU|CPU|AUTO]  (default: MULTI:NPU,GPU)\n"
                "         [--language auto|en|uk|de|fr|...]           (default: auto)\n"
                "         [--beam N]     beam search width (default: 5, use 1 for greedy)\n"
                "         [--threads N]                               (default: "
             << default_threads << ")\n"
+               "         [--vad]        skip silence with Voice Activity Detection\n"
+               "         [--vad-model path]  path to silero VAD model (default: auto-search)\n"
                "         [--loop N]     repeat inference N times (default: 1)\n"
                "                        use --loop 20 to see NPU in Task Manager\n"
                "         [--ov-model encoder.xml]\n"
@@ -371,12 +373,14 @@ int main(int argc, char** argv)
     std::string model_arg    = argv[1];
     std::string model_path   = resolve_model(argv[1]);
     std::string audio_path   = argv[2];
-    std::string ov_device    = "AUTO";   // OpenVINO picks the fastest device
+    std::string ov_device    = "MULTI:NPU,GPU";  // NPU + GPU in parallel, fastest wins
     std::string ov_model_xml = "";
     std::string language     = "auto";   // whisper auto-detects the language
     int         n_threads    = default_threads;
     int         n_loops      = 1;        // repeat inference N times (benchmark / Task Manager)
     int         beam_size    = 5;        // beam search width (1 = greedy)
+    bool        use_vad      = false;    // Voice Activity Detection (skip silence)
+    std::string vad_model    = "";       // path to silero VAD model
 
     for (int i = 3; i < argc; ++i) {
         std::string arg = argv[i];
@@ -392,6 +396,10 @@ int main(int argc, char** argv)
             n_loops = std::max(1, std::atoi(argv[++i]));
         else if ((arg == "--beam" || arg == "-b") && i + 1 < argc)
             beam_size = std::max(1, std::atoi(argv[++i]));
+        else if (arg == "--vad")
+            use_vad = true;
+        else if (arg == "--vad-model" && i + 1 < argc)
+            vad_model = argv[++i];
     }
 
     // OpenVINO device names are CASE-SENSITIVE uppercase (CPU, GPU, NPU, AUTO).
@@ -438,8 +446,42 @@ int main(int argc, char** argv)
         printf("Audio:  %s  (%.1f s, %zu samples)\n",
                audio_path.c_str(), audio_sec, pcmf32.size());
 
+    // ── Auto-locate VAD model if --vad was requested without --vad-model ────
+    if (use_vad && vad_model.empty()) {
+        // Search same directories as the whisper model
+        static const char* vad_names[] = {
+            "ggml-silero-v5.1.2.bin",
+            "ggml-silero-v6.2.0.bin",
+        };
+        std::string exd = exe_dir();
+        for (const char* vn : vad_names) {
+            // CWD
+            if (file_exists(vn)) { vad_model = vn; break; }
+            // Next to exe
+            if (!exd.empty() && file_exists(exd + vn)) { vad_model = exd + vn; break; }
+            // Project root
+            if (!exd.empty()) {
+                std::string root = dir_up(exd, 2);
+                if (!root.empty() && file_exists(root + vn)) { vad_model = root + vn; break; }
+            }
+        }
+        if (vad_model.empty()) {
+            fprintf(stderr,
+                "[WARNING] --vad requested but no silero VAD model found.\n"
+                "  Download it with:  py -3 setup_models.py --vad\n"
+                "  Then rebuild:      cmake --build build --config Release\n"
+                "  VAD disabled for this run.\n\n");
+            use_vad = false;
+        } else {
+            printf("VAD model: %s\n", vad_model.c_str());
+        }
+    }
+
     // ── Init whisper context ─────────────────────────────────────────────
     struct whisper_context_params cparams = whisper_context_default_params();
+    // Flash attention: faster decoder self-attention, especially on medium/large.
+    // Uses less memory and is ~20-40% faster on the CPU decode side.
+    cparams.flash_attn = true;
     struct whisper_context* ctx =
         whisper_init_from_file_with_params(model_path.c_str(), cparams);
 
@@ -551,6 +593,17 @@ int main(int argc, char** argv)
     wparams.entropy_thold    = 2.8f;   // higher = less aggressive fallback
     wparams.logprob_thold    = -1.0f;
     wparams.no_speech_thold  = 0.6f;
+
+    // VAD: skip non-speech segments before sending to the encoder.
+    // Silero VAD runs on CPU and is very fast (~5 ms per 30s chunk).
+    // Benefit: encoder + decoder only run on actual speech → major speedup
+    // for recordings with pauses, slow speech, or long silences.
+    if (use_vad && !vad_model.empty()) {
+        wparams.vad            = true;
+        wparams.vad_model_path = vad_model.c_str();
+        wparams.vad_params     = whisper_vad_default_params();
+        printf("VAD:      enabled  (silence will be skipped)\n");
+    }
 
     if (n_loops > 1)
         printf("Language: %-6s  |  Beam: %d  |  Threads: %d  |  Device: %s  |  Loops: %d\n\n",
