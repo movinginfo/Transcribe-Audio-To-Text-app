@@ -472,6 +472,8 @@ int main(int argc, char** argv)
     // ── Explicit language detection (auto mode only) ─────────────────────
     // When language=="auto", run whisper_lang_auto_detect to show detected
     // language + confidence BEFORE transcription, and warn if confidence is low.
+    // The detected language is then LOCKED IN for wparams so whisper does not
+    // re-detect mid-transcription (which can cause language drift on mixed audio).
     std::string detected_lang_str = language;  // used in summary
     if (language == "auto") {
         int n_lang = whisper_lang_max_id() + 1;
@@ -481,9 +483,9 @@ int main(int argc, char** argv)
         if (detected_id >= 0) {
             const char* det = whisper_lang_str(detected_id);
             float conf = lang_probs[detected_id];
-            detected_lang_str = det ? det : "?";
+            detected_lang_str = det ? det : "auto";
 
-            // Find top-5 candidates for display
+            // Find top-3 candidates for display
             std::vector<std::pair<float,int>> ranked;
             ranked.reserve(n_lang);
             for (int i = 0; i < n_lang; ++i)
@@ -510,6 +512,14 @@ int main(int argc, char** argv)
         }
     }
 
+    // Lock in the language: if we detected it above, use that instead of "auto".
+    // This prevents whisper from re-running language detection during transcription
+    // and avoids language drift when the same model is used for uk / en / de etc.
+    const std::string final_language =
+        (language == "auto" && detected_lang_str != "auto")
+        ? detected_lang_str
+        : language;
+
     // ── Inference parameters ─────────────────────────────────────────────
     const bool use_beam = (beam_size > 1);
     struct whisper_full_params wparams =
@@ -520,8 +530,9 @@ int main(int argc, char** argv)
     wparams.print_special    = false;
     wparams.print_realtime   = false;
     wparams.print_timestamps = true;
-    wparams.language         = language.c_str();  // "auto" = whisper detects language
+    wparams.language         = final_language.c_str();
     wparams.n_threads        = n_threads;
+    wparams.translate        = false;   // never auto-translate
 
     // Beam search
     if (use_beam)
@@ -529,15 +540,24 @@ int main(int argc, char** argv)
 
     // Suppress non-speech tokens like [музика], [аплодисменти], etc.
     wparams.suppress_nst     = true;
-    // Suppress blank-only segments
     wparams.suppress_blank   = true;
+
+    // Temperature fallback: start at 0 (deterministic), retry with +0.2
+    // if the decoder entropy or log-prob indicates low confidence.
+    // This recovers accuracy on noisy or fast speech without slowing down
+    // clean/clear audio (fallback is only triggered when needed).
+    wparams.temperature      = 0.0f;
+    wparams.temperature_inc  = 0.2f;
+    wparams.entropy_thold    = 2.8f;   // higher = less aggressive fallback
+    wparams.logprob_thold    = -1.0f;
+    wparams.no_speech_thold  = 0.6f;
 
     if (n_loops > 1)
         printf("Language: %-6s  |  Beam: %d  |  Threads: %d  |  Device: %s  |  Loops: %d\n\n",
-               language.c_str(), beam_size, n_threads, ov_device.c_str(), n_loops);
+               final_language.c_str(), beam_size, n_threads, ov_device.c_str(), n_loops);
     else
         printf("Language: %-6s  |  Beam: %d  |  Threads: %d  |  Device: %s\n\n",
-               language.c_str(), beam_size, n_threads, ov_device.c_str());
+               final_language.c_str(), beam_size, n_threads, ov_device.c_str());
 
     std::cout << "Running transcription...\n\n";
 
@@ -585,7 +605,7 @@ int main(int argc, char** argv)
 
     // ── Detected language ────────────────────────────────────────────────
     int         lang_id  = whisper_full_lang_id(ctx);
-    const char* lang_str = (lang_id >= 0) ? whisper_lang_str(lang_id) : detected_lang_str.c_str();
+    const char* lang_str = (lang_id >= 0) ? whisper_lang_str(lang_id) : final_language.c_str();
 
     // ── Print transcript (from the last loop) ────────────────────────────
     printf("\n");
